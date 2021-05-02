@@ -1,0 +1,149 @@
+--- a/drivers/input/touchscreen/goodix.c	2021-05-02 11:01:36.200099986 +0900
++++ b/drivers/input/touchscreen/goodix.c	2021-05-02 12:49:20.736999216 +0900
+@@ -9,6 +9,7 @@
+  *
+  *  2010 - 2012 Goodix Technology.
+  */
++#define DEBUG
+ 
+ 
+ #include <linux/kernel.h>
+@@ -115,6 +116,7 @@ struct goodix_ts_data {
+ 	unsigned int contact_size;
+ 	u8 config[GOODIX_CONFIG_MAX_LENGTH];
+ 	unsigned short keymap[GOODIX_MAX_KEYS];
++	bool inverted_gpios;
+ };
+ 
+ static int goodix_check_cfg_8(struct goodix_ts_data *ts,
+@@ -162,6 +164,7 @@ static const struct goodix_chip_id goodi
+ 	{ .id = "911", .data = &gt911_chip_data },
+ 	{ .id = "9271", .data = &gt911_chip_data },
+ 	{ .id = "9110", .data = &gt911_chip_data },
++	{ .id = "9111", .data = &gt911_chip_data },
+ 	{ .id = "927", .data = &gt911_chip_data },
+ 	{ .id = "928", .data = &gt911_chip_data },
+ 
+@@ -252,6 +255,32 @@ static const struct dmi_system_id invert
+ 	{}
+ };
+ 
++static void goodix_dump_gpio_state(struct goodix_ts_data *ts, const char *realm)
++{
++	if (ts->gpiod_rst) {
++		dev_dbg(&ts->client->dev, "[%s] GPIO-RST: dir %u / val %u / valRaw %u\n", 
++			realm,
++			gpiod_get_direction(ts->gpiod_rst), 
++			gpiod_get_value(ts->gpiod_rst), 
++			gpiod_get_raw_value(ts->gpiod_rst)
++		);
++	} else {
++		dev_dbg(&ts->client->dev, "[%s] GPIO-RST: not available\n", realm);
++	}
++
++	if (ts->gpiod_int) {
++		dev_dbg(&ts->client->dev, "[%s] GPIO-INT: dir %u / val %u / valRaw %u\n", 
++			realm,
++			gpiod_get_direction(ts->gpiod_int), 
++			gpiod_get_value(ts->gpiod_int), 
++			gpiod_get_raw_value(ts->gpiod_int)
++		);
++	} else {
++		dev_dbg(&ts->client->dev, "[%s] GPIO-INT: not available\n", realm);
++	}
++}
++
++
+ /**
+  * goodix_i2c_read - read data from a register of the i2c slave device.
+  *
+@@ -700,12 +729,14 @@ static int goodix_int_sync(struct goodix
+ {
+ 	int error;
+ 
+-	error = goodix_irq_direction_output(ts, 0);
++	error = goodix_irq_direction_output(ts, 0 ^ ts->inverted_gpios);
+ 	if (error)
+ 		return error;
+ 
+ 	msleep(50);				/* T5: 50ms */
+ 
++	goodix_dump_gpio_state(ts, "intsync-be4-inp");
++
+ 	error = goodix_irq_direction_input(ts);
+ 	if (error)
+ 		return error;
+@@ -722,25 +753,33 @@ static int goodix_reset(struct goodix_ts
+ {
+ 	int error;
+ 
++	goodix_dump_gpio_state(ts, "be4 HR");
++
++	//initial reset state as seen by GT IC: RST=0 (reset), INT=0
+ 	/* begin select I2C slave addr */
+-	error = gpiod_direction_output(ts->gpiod_rst, 0);
++	error = gpiod_direction_output(ts->gpiod_int, 0 ^ ts->inverted_gpios);
++	if (error)
++		return error;
++	error = gpiod_direction_output(ts->gpiod_rst, 0 ^ ts->inverted_gpios);
+ 	if (error)
+ 		return error;
+-
+ 	msleep(20);				/* T2: > 10ms */
+ 
+ 	/* HIGH: 0x28/0x29, LOW: 0xBA/0xBB */
+-	error = goodix_irq_direction_output(ts, ts->client->addr == 0x14);
++	error = goodix_irq_direction_output(ts, (ts->client->addr==0x14));
+ 	if (error)
+ 		return error;
+ 
+ 	usleep_range(100, 2000);		/* T3: > 100us */
+ 
++	goodix_dump_gpio_state(ts, "HR-start");
++
+ 	error = gpiod_direction_output(ts->gpiod_rst, 1);
+ 	if (error)
+ 		return error;
+ 
+ 	usleep_range(6000, 10000);		/* T4: > 5ms */
++	goodix_dump_gpio_state(ts, "int1-rst1");
+ 
+ 	/* end select I2C slave addr */
+ 	error = gpiod_direction_input(ts->gpiod_rst);
+@@ -888,6 +927,9 @@ static int goodix_get_gpio_config(struct
+ 		return -EINVAL;
+ 	dev = &ts->client->dev;
+ 
++	// temporary enable invert
++	ts->inverted_gpios = true;
++
+ 	ts->avdd28 = devm_regulator_get(dev, "AVDD28");
+ 	if (IS_ERR(ts->avdd28)) {
+ 		error = PTR_ERR(ts->avdd28);
+@@ -1248,6 +1290,18 @@ static int goodix_ts_probe(struct i2c_cl
+ 		return error;
+ 	}
+ 
++	if (ts->gpiod_int && ts->gpiod_rst) {
++		/* reset the controller */
++		dev_dbg(&client->dev, "Hard-resetting device...");
++		error = goodix_reset(ts);
++		if (error) {
++			dev_err(&client->dev, "Controller hard-reset failed.\n");
++			return error;
++		}
++	} else {
++		dev_warn(&client->dev, "Skipping controller hard-reset due to GPIO int/rst not available.\n");
++	}
++
+ 	error = devm_add_action_or_reset(&client->dev,
+ 					 goodix_disable_regulators, ts);
+ 	if (error)
+@@ -1443,6 +1497,7 @@ static const struct of_device_id goodix_
+ 	{ .compatible = "goodix,gt5688" },
+ 	{ .compatible = "goodix,gt911" },
+ 	{ .compatible = "goodix,gt9110" },
++	{ .compatible = "goodix,gt9111" },
+ 	{ .compatible = "goodix,gt912" },
+ 	{ .compatible = "goodix,gt9147" },
+ 	{ .compatible = "goodix,gt917s" },
